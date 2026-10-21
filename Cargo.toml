@@ -1,0 +1,57 @@
+[package]
+name = "superfastcopy"
+version = "1.0.0"
+edition = "2021"
+description = "Super Fast Copy (SFC): very fast parallel file copier for Windows, tuned for folders with many small files"
+license = "MIT"
+repository = "https://github.com/boulbeba115/sfc-super-fast-copy"
+readme = "README.md"
+keywords = ["copy", "windows", "file-copy", "robocopy", "explorer"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lib]
+name = "superfastcopy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "superfastcopy"
+path = "src/bin/superfastcopy.rs"
+
+[[bin]]
+name = "superfastcopy-gui"
+path = "src/bin/superfastcopy-gui/main.rs"
+
+[dependencies]
+rayon = "1.10"
+crossbeam-channel = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+raw-window-handle = "0.6"
+rfd = "0.15"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

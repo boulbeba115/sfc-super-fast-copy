@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# Always use Rust's bundled MinGW linker and runtime, even if another MinGW
+# (needed only for dlltool) is on PATH.
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v2"]

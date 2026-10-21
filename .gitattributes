@@ -1,0 +1,8 @@
+# Normalize text files to LF in the repository.
+* text=auto
+
+# Binary assets: never convert line endings.
+*.a      binary
+*.ico    binary
+*.png    binary
+*.rgba   binary
