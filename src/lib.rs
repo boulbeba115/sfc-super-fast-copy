@@ -5,8 +5,9 @@
 //! * Directories are enumerated with `FindFirstFileEx` (large fetch, no 8.3
 //!   names), which also returns size/attributes/times, so files are never
 //!   stat'ed individually.
-//! * Enumeration and copying run together on a work-stealing pool, so
-//!   copying starts immediately and every disk stays busy.
+//! * Enumeration and copying run at the same time: a small scan pool walks
+//!   the tree and queues batches of files for the copy threads, so copying
+//!   starts immediately and the totals are known early.
 //! * Small files take a minimal-syscall path with a reused per-thread
 //!   buffer; metadata is set on the open handle and the (slow, antivirus-
 //!   scanned) close happens on separate closer threads.
@@ -22,7 +23,7 @@ pub mod win;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
@@ -124,7 +125,7 @@ impl Snapshot {
 pub struct Job {
     stats: Stats,
     cancel: AtomicI32,
-    pending_dirs: AtomicUsize,
+    scan_done: AtomicBool,
     errors_total: AtomicU64,
     errors: Mutex<Vec<String>>,
     plan: Mutex<Option<String>>,
@@ -141,8 +142,7 @@ impl Job {
         Self {
             stats: Stats::default(),
             cancel: AtomicI32::new(0),
-            // Held until all roots are queued, so the scan can't look done early.
-            pending_dirs: AtomicUsize::new(1),
+            scan_done: AtomicBool::new(false),
             errors_total: AtomicU64::new(0),
             errors: Mutex::new(Vec::new()),
             plan: Mutex::new(None),
@@ -181,7 +181,7 @@ impl Job {
             bytes_done: s.bytes_done.load(Relaxed),
             links_skipped: s.links_skipped.load(Relaxed),
             errors: self.errors_total.load(Relaxed),
-            scan_done: self.pending_dirs.load(Relaxed) == 0,
+            scan_done: self.scan_done.load(Relaxed),
         }
     }
 
@@ -222,7 +222,7 @@ struct Root {
 pub fn run(job: &Job, sources: &[PathBuf], dest: &Path, opts: &Options) -> Result<(), String> {
     let result = run_inner(job, sources, dest, opts);
     // Make sure observers see the scan as finished even on early errors.
-    job.pending_dirs.store(0, Relaxed);
+    job.scan_done.store(true, Relaxed);
     result
 }
 
@@ -263,13 +263,16 @@ fn run_inner(job: &Job, sources: &[PathBuf], dest: &Path, opts: &Options) -> Res
         dst_media.name()
     ));
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("sfc-{i}"))
-        .build()
-        .map_err(|e| format!("cannot start worker threads: {e}"))?;
-    let closer = win::Closer::new((threads / 2).clamp(2, 16));
     let hdd = src_media == Media::Hdd || dst_media == Media::Hdd;
+    // Scanning gets its own threads so it runs ahead of copying: listing
+    // folders is much faster than copying them, so the totals (and with them
+    // the percentage and time estimate) become final early in the job.
+    let scan_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(if hdd { 2 } else { threads.min(8) })
+        .thread_name(|i| format!("sfc-scan-{i}"))
+        .build()
+        .map_err(|e| format!("cannot start scan threads: {e}"))?;
+    let closer = win::Closer::new((threads / 2).clamp(2, 16));
     let ctx = Ctx {
         job,
         opts,
@@ -277,14 +280,44 @@ fn run_inner(job: &Job, sources: &[PathBuf], dest: &Path, opts: &Options) -> Res
         dir_meta: Mutex::new(Vec::new()),
         large_gate: hdd.then(|| Mutex::new(())),
     };
+    let (tx, rx) = crossbeam_channel::unbounded::<Work>();
 
-    pool.scope(|s| {
-        for root in roots {
-            if root.meta.is_dir() {
-                job.pending_dirs.fetch_add(1, Relaxed);
-                let ctx = &ctx;
-                s.spawn(move |s| process_dir(s, ctx, root.src, root.dst, root.set_meta.then_some(root.meta)));
-            } else {
+    std::thread::scope(|ts| {
+        let ctx = &ctx;
+        for i in 0..threads {
+            let rx = rx.clone();
+            let spawned = std::thread::Builder::new().name(format!("sfc-{i}")).spawn_scoped(ts, move || {
+                for work in rx {
+                    match work {
+                        Work::Files(b) => {
+                            for e in &b.files {
+                                copy_file(ctx, &win::join_z(&b.src_dir, &e.name), &win::join_z(&b.dst_dir, &e.name), e);
+                            }
+                        }
+                        Work::Single { src, dst, meta } => copy_file(ctx, &win::zstr(&src), &win::zstr(&dst), &meta),
+                    }
+                }
+            });
+            if let Err(e) = spawned {
+                // The threads already running drain the queue and exit once
+                // `tx` is dropped; nothing has been queued yet.
+                job.error(format!("could only start {i} of {threads} copy threads: {e}"));
+                if i == 0 {
+                    drop(tx);
+                    return;
+                }
+                break;
+            }
+        }
+        drop(rx);
+
+        let sender = &tx;
+        scan_pool.scope(|s| {
+            for root in roots {
+                if root.meta.is_dir() {
+                    s.spawn(move |s| process_dir(s, ctx, sender, root.src, root.dst, root.set_meta.then_some(root.meta)));
+                    continue;
+                }
                 let st = &job.stats;
                 st.files_found.fetch_add(1, Relaxed);
                 st.bytes_found.fetch_add(root.meta.size, Relaxed);
@@ -294,13 +327,13 @@ fn run_inner(job: &Job, sources: &[PathBuf], dest: &Path, opts: &Options) -> Res
                     st.bytes_done.fetch_add(root.meta.size, Relaxed);
                     continue;
                 }
-                let ctx = &ctx;
-                s.spawn(move |_| {
-                    copy_file(ctx, &win::zstr(&root.src), &win::zstr(&root.dst), &root.meta)
-                });
+                let _ = sender.send(Work::Single { src: root.src, dst: root.dst, meta: root.meta });
             }
-        }
-        job.pending_dirs.fetch_sub(1, Relaxed);
+        });
+        job.scan_done.store(true, Relaxed);
+        // Closing the queue lets the copy threads exit once it's drained;
+        // the scope then joins them.
+        drop(tx);
     });
 
     let Ctx { closer: sender, dir_meta, .. } = ctx;
@@ -309,7 +342,7 @@ fn run_inner(job: &Job, sources: &[PathBuf], dest: &Path, opts: &Options) -> Res
 
     // Folder times last: creating files inside a folder changes its times.
     let dir_meta = dir_meta.into_inner().unwrap();
-    pool.install(|| {
+    scan_pool.install(|| {
         dir_meta.par_iter().for_each(|d| {
             if let Err(e) = win::set_dir_meta(&d.path, &d.meta) {
                 job.error(format!("{}: setting folder times: {e}", win::display(&d.path)));
@@ -333,24 +366,30 @@ fn name_key(name: &[u16]) -> Wide {
         .collect()
 }
 
-/// Decrements the pending-folder count however `process_dir` exits.
-struct PendingGuard<'a>(&'a AtomicUsize);
-
-impl Drop for PendingGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Relaxed);
-    }
+/// Files of one folder, passed from the scanner to the copy threads.
+struct Batch {
+    src_dir: Arc<Wide>,
+    dst_dir: Arc<Wide>,
+    files: Vec<Entry>,
 }
 
+enum Work {
+    Files(Batch),
+    /// A file given directly as a source (full paths, no folder).
+    Single { src: Wide, dst: Wide, meta: Entry },
+}
+
+/// Lists one folder: creates it in the destination, queues its files for
+/// copying and schedules its sub-folders on the scan pool.
 fn process_dir<'s, 'a: 's>(
     s: &rayon::Scope<'s>,
     ctx: &'s Ctx<'a>,
+    tx: &'s Sender<Work>,
     src: Wide,
     dst: Wide,
     meta: Option<Entry>,
 ) {
     let job = ctx.job;
-    let _pending = PendingGuard(&job.pending_dirs);
     if job.is_cancelled() {
         return;
     }
@@ -380,13 +419,8 @@ fn process_dir<'s, 'a: 's>(
     let dst_dir = Arc::new(dst);
     let mut batch: Vec<Entry> = Vec::new();
     let mut batch_bytes = 0u64;
-    let flush = |batch: Vec<Entry>| {
-        let (sd, dd) = (src_dir.clone(), dst_dir.clone());
-        s.spawn(move |_| {
-            for e in &batch {
-                copy_file(ctx, &win::join_z(&sd, &e.name), &win::join_z(&dd, &e.name), e);
-            }
-        });
+    let flush = |files: Vec<Entry>| {
+        let _ = tx.send(Work::Files(Batch { src_dir: src_dir.clone(), dst_dir: dst_dir.clone(), files }));
     };
 
     for e in entries {
@@ -397,9 +431,8 @@ fn process_dir<'s, 'a: 's>(
                 st.links_skipped.fetch_add(1, Relaxed);
                 continue;
             }
-            job.pending_dirs.fetch_add(1, Relaxed);
             let (cs, cd) = (win::join(&src_dir, &e.name), win::join(&dst_dir, &e.name));
-            s.spawn(move |s| process_dir(s, ctx, cs, cd, Some(e)));
+            s.spawn(move |s| process_dir(s, ctx, tx, cs, cd, Some(e)));
             continue;
         }
 

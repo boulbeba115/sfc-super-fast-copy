@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Progress ring no longer jumps backwards (e.g. 50% → 32%). Folder scanning now runs on
+  its own threads ahead of copying, so the totals are final within moments; until then
+  the ring shows a spinner with the number of files found.
+- Time remaining now works: it's estimated from the recent file and data rates (whichever
+  finishes later), smoothed so it counts down steadily.
+
 ## [1.0.0] - 2026-10-22
 
 First public release.

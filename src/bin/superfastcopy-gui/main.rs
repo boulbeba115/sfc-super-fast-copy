@@ -30,6 +30,8 @@ const LOGO: &[u8] = include_bytes!("../../../assets/icon-128.rgba");
 /// Speed samples kept for the graph (4 per second).
 const HISTORY: usize = 160;
 const CARD_H: f32 = 272.0;
+/// How far back the time estimate looks when measuring progress speed.
+const ETA_WINDOW: Duration = Duration::from_secs(6);
 
 /// Explorer passes drive roots as `"D:\"`, which Windows argument parsing
 /// turns into `D:"` (the backslash escapes the quote).
@@ -99,6 +101,15 @@ struct Run {
     speed: VecDeque<f32>,
     files_rate: VecDeque<f32>,
     errors: Vec<String>,
+    /// Highest progress reached once the totals are known; the ring never
+    /// goes below it.
+    target: f32,
+    /// What the ring shows: eased towards `target` every frame.
+    shown: f32,
+    /// (time, files done, bytes done) over the last `ETA_WINDOW`.
+    progress_hist: VecDeque<(Instant, u64, u64)>,
+    /// Smoothed seconds remaining.
+    eta: Option<f64>,
 }
 
 impl Run {
@@ -120,6 +131,10 @@ impl Run {
             speed: VecDeque::new(),
             files_rate: VecDeque::new(),
             errors: Vec::new(),
+            target: 0.0,
+            shown: 0.0,
+            progress_hist: VecDeque::new(),
+            eta: None,
         }
     }
 
@@ -155,6 +170,52 @@ impl Run {
             push(&mut self.speed, fmt::rate(s.bytes_copied.saturating_sub(self.last.1), dt));
             push(&mut self.files_rate, fmt::rate(s.files_copied.saturating_sub(self.last.2), dt));
             self.last = (now, s.bytes_copied, s.files_copied);
+            if s.scan_done {
+                self.update_estimate(now, dt, s);
+            }
+        }
+        // Ease the ring towards the target so it moves smoothly.
+        self.shown += (self.target - self.shown) * 0.2;
+        if (self.target - self.shown).abs() < 0.001 {
+            self.shown = self.target;
+        }
+    }
+
+    /// Time left from the speed over the last few seconds. Files and data
+    /// are estimated separately and the later one wins: big files finishing
+    /// early mustn't make thousands of small files look almost done, and a
+    /// single huge file has no file rate at all. Each new estimate is
+    /// blended with the previous one (counted down by the time that passed),
+    /// so the number ticks down steadily instead of jumping around.
+    fn update_estimate(&mut self, now: Instant, dt: Duration, s: &Snapshot) {
+        self.target = self.target.max(s.fraction());
+        self.progress_hist.push_back((now, s.files_done(), s.bytes_done));
+        while self.progress_hist.len() > 2 && now - self.progress_hist[0].0 > ETA_WINDOW {
+            self.progress_hist.pop_front();
+        }
+        let (t0, f0, b0) = self.progress_hist[0];
+        let span = (now - t0).as_secs_f64();
+        if span < 1.0 {
+            return;
+        }
+        let time_left = |left: u64, done_in_window: u64| {
+            let rate = done_in_window as f64 / span;
+            (left > 0 && rate > 0.0).then(|| left as f64 / rate)
+        };
+        let by_files = time_left(s.files_found.saturating_sub(s.files_done()), s.files_done().saturating_sub(f0));
+        let by_bytes = time_left(s.bytes_found.saturating_sub(s.bytes_done), s.bytes_done.saturating_sub(b0));
+        let estimate = match (by_files, by_bytes) {
+            (Some(f), Some(b)) => Some(f.max(b)),
+            (f, b) => f.or(b),
+        };
+        if let Some(estimate) = estimate {
+            self.eta = Some(match self.eta {
+                None => estimate,
+                Some(prev) => (prev - dt.as_secs_f64()).max(0.0) * 0.8 + estimate * 0.2,
+            });
+        } else if let Some(prev) = self.eta {
+            // Stalled (e.g. waiting on a slow disk): keep counting down.
+            self.eta = Some((prev - dt.as_secs_f64()).max(0.0));
         }
     }
 
@@ -628,7 +689,7 @@ impl App {
         let elapsed = run.elapsed();
         let failed = matches!(run.finished, Some((_, Err(_))));
         let cancelled = run.job.is_cancelled();
-        let frac = if running { s.fraction() } else { 1.0 };
+        let frac = if running { run.shown } else { 1.0 };
         let (bps, fps) = if running {
             run.current_speed()
         } else {
@@ -651,13 +712,21 @@ impl App {
             } else {
                 (GOOD, w::lerp(GOOD, ACCENT2, 0.6))
             };
-            let spin = (running && s.files_found == 0).then(|| ui.input(|i| i.time));
+            // Until the scan has found everything the total is still growing,
+            // so a percentage would jump around: spin and count instead.
+            let scanning = running && !s.scan_done;
+            let spin = scanning.then(|| ui.input(|i| i.time));
             w::ring(p, c, r, width, frac, spin, a, b);
-            let big = FontId::new(if compact { 28.0 } else { 36.0 }, semibold());
-            if running {
+            let sub_y = c + vec2(0.0, if compact { 18.0 } else { 22.0 });
+            if scanning {
+                let size = if compact { 20.0 } else { 24.0 };
+                p.text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, fmt::count(s.files_found), FontId::new(size, semibold()), TEXT);
+                p.text(sub_y, Align2::CENTER_CENTER, "files found", FontId::proportional(12.5), MUTED);
+            } else if running {
+                let big = FontId::new(if compact { 28.0 } else { 36.0 }, semibold());
                 p.text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, format!("{:.0}%", frac * 100.0), big, TEXT);
-                let sub = if cancelled { "cancelling" } else if s.scan_done { "complete" } else { "scanning…" };
-                p.text(c + vec2(0.0, if compact { 18.0 } else { 22.0 }), Align2::CENTER_CENTER, sub, FontId::proportional(12.5), MUTED);
+                let sub = if cancelled { "cancelling" } else { "complete" };
+                p.text(sub_y, Align2::CENTER_CENTER, sub, FontId::proportional(12.5), MUTED);
             } else {
                 let (glyph, color, label) = if failed {
                     (icon::ERROR, BAD, "Failed")
@@ -708,12 +777,12 @@ impl App {
         });
 
         ui.add_space(12.0);
-        let remaining = if running && s.scan_done && frac > 0.02 {
-            fmt::duration(elapsed.mul_f64((1.0 - frac as f64) / frac as f64))
-        } else if running {
-            "estimating…".into()
-        } else {
+        let remaining = if !running {
             "—".into()
+        } else if !s.scan_done {
+            "after scan".into()
+        } else {
+            run.eta.map_or_else(|| "estimating…".into(), eta_text)
         };
         let tiles = [
             (
@@ -873,6 +942,17 @@ impl App {
     }
 }
 
+/// Time left, rounded the way people read a countdown.
+fn eta_text(secs: f64) -> String {
+    if secs < 1.0 {
+        "almost done".into()
+    } else if secs < 60.0 {
+        format!("{:.0} s", secs.ceil())
+    } else {
+        fmt::duration(Duration::from_secs_f64(secs))
+    }
+}
+
 fn lerp_warn() -> Color32 {
     w::lerp(WARN, BAD, 0.4)
 }
@@ -976,7 +1056,8 @@ impl eframe::App for App {
         }
 
         let title = match &self.run {
-            Some(r) if r.running() => format!("{:.0}% · Super Fast Copy", r.job.snapshot().fraction() * 100.0),
+            Some(r) if r.running() && !r.job.snapshot().scan_done => "Scanning · Super Fast Copy".into(),
+            Some(r) if r.running() => format!("{:.0}% · Super Fast Copy", r.shown * 100.0),
             _ => "Super Fast Copy".into(),
         };
         if title != self.title {
